@@ -1,17 +1,22 @@
-// Boot and the one loop: input is read every frame, the world advances in fixed 1/60 s steps
-// (several in a slow frame, none in a fast one), and the renderer paints what is there. The game
-// moves between four screens: title, play, paused and game over.
+// Harbor Lights — boot and the one loop: input is read every frame, the world
+// advances in fixed 1/60 s steps, and the renderer paints what is there.
+// Screens: title, play, paused, busted, dead, done.
 //
-// ?seed=N fixes the falling pattern. ?shot=start|play|end (with &seed=N) stages that scene
-// instead of running the loop, paints it twice and sets window.__shotReady for a screenshot.
-import { BEST_KEY, LIVES, STEP } from './config.js';
+// ?seed=N fixes the city and the traffic. ?shot=start|play|chase|end (with
+// &seed=N) stages that scene instead of running the loop, paints it twice
+// and sets window.__shotReady for a screenshot.
+import { SAVE_KEY, STEP } from './config.js';
 import { createRandom } from './random.js';
-import { createWorld, EVENT_HIT, EVENT_OVER } from './world.js';
-import { ACTION_CONFIRM, ACTION_PAUSE, createInput } from './input.js';
-import { createRenderer, SCREEN_OVER, SCREEN_PAUSED, SCREEN_PLAY, SCREEN_TITLE } from './render.js';
+import { createWorld } from './world.js';
+import {
+  ACTION_CONFIRM, ACTION_INTERACT, ACTION_MUTE, ACTION_PAUSE, ACTION_RESTART,
+  createInput,
+} from './input.js';
+import { createRenderer } from './render.js';
+import { createAudio } from './audio.js';
 import { stageShot } from './shots.js';
 
-/** The longest frame the loop catches up on; a longer stall (a hidden tab) is dropped, not replayed. */
+/** The longest frame the loop catches up on; a longer stall is dropped, not replayed. */
 const MAX_FRAME = 0.25;
 
 const params = new URLSearchParams(window.location.search);
@@ -23,28 +28,25 @@ const canvas = document.getElementById('game');
 const status = document.getElementById('status');
 const world = createWorld(createRandom(seed));
 const renderer = createRenderer(canvas);
+const audio = createAudio();
+window.__solmarDebug = world.debug;
 
-function readBest() {
+function hasSave() {
   try {
-    return Number.parseInt(window.localStorage.getItem(BEST_KEY) ?? '0', 10) || 0;
+    return !!window.localStorage.getItem(SAVE_KEY);
   } catch {
-    return 0;
-  }
-}
-
-function saveBest(value) {
-  try {
-    window.localStorage.setItem(BEST_KEY, String(value));
-  } catch {
-    // Storage can be off (private windows): the best score then lasts this visit only.
+    return false;
   }
 }
 
 function runShot(name) {
-  const scene = stageShot(name, world);
+  const known = ['start', 'play', 'chase', 'end'];
+  const scene = known.includes(name) ? name : 'start';
+  if (scene !== name) console.warn(`Harbor Lights: unknown shot "${name}", staging start instead.`);
+  stageShot(scene, world);
   let painted = 0;
   function paint() {
-    renderer.draw(world.state, scene.screen, scene.best);
+    renderer.draw(world.state, world.state.time, hasSave());
     painted += 1;
     if (painted < 2) requestAnimationFrame(paint);
     else window.__shotReady = true;
@@ -54,79 +56,118 @@ function runShot(name) {
 
 function runGame() {
   const input = createInput(canvas);
-  let screen = SCREEN_TITLE;
-  let best = readBest();
   let accumulator = 0;
   let last = performance.now();
+  let saved = hasSave();
 
-  // Screen readers (and anyone watching the page's text) hear the screen changes and each hit.
   function announce(message) {
     status.textContent = message;
   }
 
   function startGame() {
-    world.reset();
-    accumulator = 0;
-    screen = SCREEN_PLAY;
-    announce(`Playing. ${LIVES} lives.`);
-  }
-
-  function endGame() {
-    screen = SCREEN_OVER;
-    if (world.state.score > best) {
-      best = world.state.score;
-      saveBest(best);
+    audio.resume();
+    audio.startMusic();
+    if (saved && world.loadSave()) {
+      world.state.mode = 'play';
+      announce('Continuing your saved game in Solmar Bay.');
+    } else {
+      world.newGame();
+      announce('Playing. Mara Voss, getaway driver. First job: the Old Docks.');
     }
-    announce(`Game over. Score ${world.state.score}. Best ${best}.`);
+    saved = hasSave();
   }
 
-  function handleActions() {
-    const actions = input.takeActions();
-    if (actions & ACTION_CONFIRM && (screen === SCREEN_TITLE || screen === SCREEN_OVER)) startGame();
-    else if (actions & ACTION_PAUSE && screen === SCREEN_PLAY) {
-      screen = SCREEN_PAUSED;
-      announce('Paused.');
-    } else if (actions & (ACTION_PAUSE | ACTION_CONFIRM) && screen === SCREEN_PAUSED) {
-      screen = SCREEN_PLAY;
-      announce('Playing.');
+  function handleActions(actions) {
+    const state = world.state;
+    if (actions & ACTION_MUTE) {
+      audio.setMuted(!audio.isMuted());
+      announce(audio.isMuted() ? 'Muted.' : 'Sound on.');
     }
-  }
-
-  function step() {
-    if (screen === SCREEN_TITLE) {
-      world.step(STEP, 0, true);
+    if (actions & ACTION_RESTART) {
+      if (state.mode !== 'title') {
+        world.newGame();
+        announce('New game started.');
+      }
       return;
     }
-    const events = world.step(STEP, input.direction(), false);
-    if (events & EVENT_OVER) endGame();
-    else if (events & EVENT_HIT) announce(world.state.lives === 1 ? 'Hit. 1 life left.' : `Hit. ${world.state.lives} lives left.`);
+    if (actions & ACTION_CONFIRM) {
+      audio.resume();
+      if (state.mode === 'title') startGame();
+      else if (state.dialogue) world.advanceDialogue();
+      else if (state.mode === 'dead' || state.mode === 'busted') {
+        world.respawn();
+        announce('Back on the streets of Solmar Bay.');
+      } else if (state.mode === 'done') {
+        world.newGame();
+        announce('New game started.');
+      } else if (state.mode === 'paused') {
+        state.mode = 'play';
+        announce('Playing.');
+      }
+    } else if (actions & ACTION_PAUSE) {
+      if (state.mode === 'play') {
+        state.mode = 'paused';
+        announce('Paused.');
+      } else if (state.mode === 'paused') {
+        state.mode = 'play';
+        announce('Playing.');
+      }
+    }
   }
 
   function frame(now) {
     requestAnimationFrame(frame);
     accumulator += Math.min((now - last) / 1000, MAX_FRAME);
     last = now;
-    handleActions();
-    if (screen === SCREEN_TITLE || screen === SCREEN_PLAY) {
-      while (accumulator >= STEP && (screen === SCREEN_TITLE || screen === SCREEN_PLAY)) {
-        step();
+    // Take the one-shot presses exactly once per frame: the loop below must
+    // not see them again, or a single E would steal a car and exit it.
+    const actions = input.takeActions();
+    handleActions(actions);
+    const state = world.state;
+    if (state.mode === 'play') {
+      const mouse = input.mouse();
+      const ctl = {
+        up: input.up(),
+        down: input.down(),
+        left: input.left(),
+        right: input.right(),
+        move: input.move(),
+        aim: { x: mouse.x, y: mouse.y },
+        firing: mouse.down || input.takeClick(),
+        interact: !!(actions & ACTION_INTERACT),
+      };
+      while (accumulator >= STEP) {
+        // Re-read the held keys each step so a release mid-frame still lands.
+        ctl.up = input.up();
+        ctl.down = input.down();
+        ctl.left = input.left();
+        ctl.right = input.right();
+        ctl.move = input.move();
+        world.step(STEP, ctl, audio);
         accumulator -= STEP;
+        ctl.interact = false;
+        if (world.state.mode !== 'play') break;
       }
+      audio.updateMusic();
     } else {
       accumulator = 0;
+      // Every non-play screen still steps once a frame: step() is the one
+      // place updateDebug() runs, so without this window.__solmar would
+      // keep reporting 'play' while the game is paused, busted or done.
+      world.step(STEP, null, null);
     }
-    renderer.draw(world.state, screen, best);
+    renderer.draw(state, state.time, saved);
   }
 
-  // Leaving the tab pauses a running game rather than letting blocks fall unseen.
+  // Leaving the tab pauses a running game rather than letting the city run unseen.
   document.addEventListener('visibilitychange', () => {
-    if (document.hidden && screen === SCREEN_PLAY) {
-      screen = SCREEN_PAUSED;
+    if (document.hidden && world.state.mode === 'play') {
+      world.state.mode = 'paused';
       announce('Paused.');
     }
   });
 
-  announce('Block Dodger. Press Space or click to start.');
+  announce('Harbor Lights. Press Enter to start.');
   requestAnimationFrame(frame);
 }
 
